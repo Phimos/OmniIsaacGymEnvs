@@ -29,6 +29,7 @@
 
 def initialize_task(config, env, init_sim=True):
     from .config_utils.sim_config import SimConfig
+
     sim_config = SimConfig(config)
 
     from omniisaacgymenvs.tasks.allegro_hand import AllegroHandTask
@@ -37,14 +38,15 @@ def initialize_task(config, env, init_sim=True):
     from omniisaacgymenvs.tasks.anymal_terrain import AnymalTerrainTask
     from omniisaacgymenvs.tasks.ball_balance import BallBalanceTask
     from omniisaacgymenvs.tasks.cartpole import CartpoleTask
+    from omniisaacgymenvs.tasks.crazyflie import CrazyflieTask
     from omniisaacgymenvs.tasks.factory.factory_task_nut_bolt_pick import FactoryTaskNutBoltPick
     from omniisaacgymenvs.tasks.franka_cabinet import FrankaCabinetTask
+    from omniisaacgymenvs.tasks.grasping import GraspingTask
     from omniisaacgymenvs.tasks.humanoid import HumanoidLocomotionTask
     from omniisaacgymenvs.tasks.ingenuity import IngenuityTask
     from omniisaacgymenvs.tasks.quadcopter import QuadcopterTask
     from omniisaacgymenvs.tasks.shadow_hand import ShadowHandTask
-    from omniisaacgymenvs.tasks.crazyflie import CrazyflieTask
-    
+
     # Mappings from strings to environments
     task_map = {
         "AllegroHand": AllegroHandTask,
@@ -62,12 +64,11 @@ def initialize_task(config, env, init_sim=True):
         "ShadowHand": ShadowHandTask,
         "ShadowHandOpenAI_FF": ShadowHandTask,
         "ShadowHandOpenAI_LSTM": ShadowHandTask,
+        "Grasping": GraspingTask,
     }
 
     cfg = sim_config.config
-    task = task_map[cfg["task_name"]](
-        name=cfg["task_name"], sim_config=sim_config, env=env
-    )
+    task = task_map[cfg["task_name"]](name=cfg["task_name"], sim_config=sim_config, env=env)
 
     env.set_task(task=task, sim_params=sim_config.get_physics_params(), backend="torch", init_sim=init_sim)
 
