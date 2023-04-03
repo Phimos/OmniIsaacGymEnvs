@@ -1,34 +1,60 @@
 import math
 from abc import abstractmethod
+from pdb import set_trace
 
 import numpy as np
 import omni.replicator.isaac as dr
+import open3d as o3d
 import torch
-from omni.isaac.core.prims import RigidPrimView, XFormPrim
+import torch.nn.functional as F
+from omni.isaac.core.prims import RigidContactView, RigidPrim, RigidPrimView, XFormPrim
+from omni.isaac.core.scenes.scene import Scene
 from omni.isaac.core.utils.nucleus import get_assets_root_path
 from omni.isaac.core.utils.prims import get_prim_at_path
-from omni.isaac.core.utils.stage import (add_reference_to_stage,
-                                         get_current_stage)
+from omni.isaac.core.utils.stage import add_reference_to_stage, get_current_stage
 from omni.isaac.core.utils.torch import *
+from omni.isaac.gym.vec_env import VecEnvBase
 
 from omniisaacgymenvs.robots.articulations.shadow_hand import ShadowHand
-from omniisaacgymenvs.robots.articulations.views.shadow_hand_view import \
-    ShadowHandView
+from omniisaacgymenvs.robots.articulations.views.shadow_hand_view import ShadowHandView
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
+from omniisaacgymenvs.utils.config_utils.sim_config import SimConfig
 
 YCB_DATASET_DIR = "/Props/YCB/Axis_Aligned"
-YCB_DATASET_OBJECTS = []
+YCB_DATASET_OBJECTS = [
+    "002_master_chef_can",
+    "003_cracker_box",
+    "004_sugar_box",
+    "005_tomato_soup_can",
+    "006_mustard_bottle",
+    "007_tuna_fish_can",
+    "008_pudding_box",
+    "009_gelatin_box",
+    "010_potted_meat_can",
+    "011_banana",
+    "019_pitcher_base",
+    "021_bleach_cleanser",
+    "024_bowl",
+    "025_mug",
+    "035_power_drill",
+    "036_wood_block",
+    "037_scissors",
+    "040_large_marker",
+    "051_large_clamp",
+    "052_extra_large_clamp",
+    "061_foam_brick",
+]
 
 
 class GraspingTask(RLTask):
-    def __init__(self, name, sim_config, env, offset=None) -> None:
+    def __init__(self, name: str, sim_config: SimConfig, env: VecEnvBase, offset=None) -> None:
         """[summary]"""
         self._sim_config = sim_config
         self._cfg = sim_config.config
         self._task_cfg = sim_config.task_config
 
         self.object_type = self._task_cfg["env"]["objectType"]
-        assert self.object_type in ["block"]
+        assert self.object_type in YCB_DATASET_OBJECTS
 
         self.obs_type = self._task_cfg["env"]["observationType"]
         if not (self.obs_type in ["openai", "full_no_vel", "full", "full_state"]):
@@ -116,9 +142,18 @@ class GraspingTask(RLTask):
         self.av_factor = torch.tensor(self.av_factor, dtype=torch.float, device=self.device)
         self.total_successes = 0
         self.total_resets = 0
-        return
 
-    def set_up_scene(self, scene) -> None:
+        object_ply_path = "/home/user/Downloads/011_banana.ply"
+        num_points = 1024
+        pointcloud = o3d.io.read_point_cloud(object_ply_path)
+        pointcloud = torch.from_numpy(np.asarray(pointcloud.points)).float()
+        pointcloud = pointcloud[torch.randperm(pointcloud.shape[0])[:num_points]]
+        self.object_pointcloud = pointcloud.to(self.device)
+        self.num_points = num_points
+
+    def set_up_scene(self, scene: Scene) -> None:
+        scene.add_default_ground_plane()
+
         self._stage = get_current_stage()
         self._assets_root_path = get_assets_root_path()
         hand_start_translation, pose_dy, pose_dz = self.get_hand()
@@ -138,7 +173,9 @@ class GraspingTask(RLTask):
         )
         scene.add(self._objects)
         self._goals = RigidPrimView(
-            prim_paths_expr="/World/envs/env_.*/goal/object", name="goal_view", reset_xform_properties=False
+            prim_paths_expr="/World/envs/env_.*/goal/object",
+            name="goal_view",
+            reset_xform_properties=False,
         )
         self._goals._non_root_link = True  # hack to ignore kinematics
         scene.add(self._goals)
@@ -148,7 +185,7 @@ class GraspingTask(RLTask):
 
     def get_hand(self):
         hand_start_translation = torch.tensor([0.0, 0.0, 0.5], device=self.device)
-        hand_start_orientation = torch.tensor([0.0, 0.0, -0.70711, 0.70711], device=self.device)
+        hand_start_orientation = torch.tensor([0.70711, 0.70711, 0.0, 0.0], device=self.device)
 
         shadow_hand = ShadowHand(
             prim_path=self.default_zero_env_path + "/shadow_hand",
@@ -166,7 +203,7 @@ class GraspingTask(RLTask):
         pose_dy, pose_dz = -0.39, 0.10
         return hand_start_translation, pose_dy, pose_dz
 
-    def get_hand_view(self, scene):
+    def get_hand_view(self, scene: Scene):
         hand_view = ShadowHandView(prim_paths_expr="/World/envs/.*/shadow_hand", name="shadow_hand_view")
         scene.add(hand_view._fingers)
         return hand_view
@@ -179,6 +216,20 @@ class GraspingTask(RLTask):
             self.num_envs * self.num_fingertips, 3
         )
         self.fingertip_velocities = self._hands._fingers.get_velocities(clone=False)
+
+        # fingertip_positions = self.compute_fingertip_positions()
+        # print(fingertip_positions)
+        # print("fingertip_positions shape: ", fingertip_positions.shape)
+
+        # print(self.fingertip_pos)
+
+        # pointcloud = self.compute_object_pointcloud()
+        # print(pointcloud)
+        # print(pointcloud.shape)
+
+        # minimum_distance = self.compute_fingertip_object_minimum_distances()
+        # print(minimum_distance)
+        # print(minimum_distance.shape)
 
         self.hand_dof_pos = self._hands.get_joint_positions(clone=False)
         self.hand_dof_vel = self._hands.get_joint_velocities(clone=False)
@@ -234,6 +285,69 @@ class GraspingTask(RLTask):
             self.obs_buf[:, 81:85] = self.goal_rot
             self.obs_buf[:, 85:89] = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
             self.obs_buf[:, 89:109] = self.actions
+
+    #####################################################################
+    ###=====================compute observations======================###
+    #####################################################################
+
+    def compute_fingertip_positions(self):
+        positions = self._hands._fingers.get_world_poses(clone=False)[0]
+        positions = positions.reshape(self.num_envs, self.num_fingertips, 3)
+        positions -= self._env_pos.reshape(self.num_envs, 1, 3)
+        return positions
+
+    def compute_fingertip_rotations(self):
+        return self._hands._fingers.get_world_poses(clone=False)[1]
+
+    def compute_fingertip_velocities(self):
+        return self._hands._fingers.get_velocities(clone=False)
+
+    def compute_fingertip_object_minimum_distances(self):
+        object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
+        fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
+
+        # Compute distances between fingertip positions and object pointcloud
+        distances = torch.norm(object_pointcloud[:, None, :, :] - fingertip_positions[:, :, None, :], dim=-1)
+
+        # Find minimum distance for each fingertip and object
+        min_distances = distances.min(dim=2)[0]  # [num_envs, num_fingertips]
+
+        return min_distances
+
+    def compute_hand_joint_angles(self):
+        return self._hands.get_joint_positions(clone=False)
+
+    def compute_hand_joint_velocities(self):
+        return self._hands.get_joint_velocities(clone=False)
+
+    def compute_object_positions(self):
+        positions = self._objects.get_world_poses(clone=False)[0]
+        positions -= self._env_pos
+        return positions
+
+    def compute_object_rotations(self):
+        return self._objects.get_world_poses(clone=False)[1]
+
+    def compute_object_velocities(self):
+        return self._objects.get_velocities(clone=False)
+
+    def compute_object_linear_velocities(self):
+        return self._objects.get_linear_velocities(clone=False)
+
+    def compute_object_angular_velocities(self):
+        return self._objects.get_angular_velocities(clone=False)
+
+    def compute_object_pointcloud(self):
+        positions, rotations = self._objects.get_world_poses(clone=False)
+        pointcloud = self.object_pointcloud.clone()
+
+        pointcloud = pointcloud.reshape(1, -1, 3).repeat(self.num_envs, 1, 1).reshape(-1, 3)
+        rotations = rotations.reshape(-1, 1, 4).repeat(1, self.num_points, 1).reshape(-1, 4)
+
+        pointcloud = quat_rotate(rotations, pointcloud).reshape(self.num_envs, -1, 3)
+        pointcloud += positions.reshape(self.num_envs, 1, 3)
+        pointcloud -= self._env_pos.reshape(self.num_envs, 1, 3)
+        return pointcloud
 
     def compute_full_observations(self, no_vel=False):
         if no_vel:
@@ -364,10 +478,16 @@ class GraspingTask(RLTask):
         self.object_start_translation[1] += pose_dy
         self.object_start_translation[2] += pose_dz
         self.object_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-        self.object_usd_path = f"{self._assets_root_path}/Isaac/Props/Blocks/block_instanceable.usd"
-        
-        print(f"{self._assets_root_path}{YCB_DATASET_DIR}")
-        
+        if self.object_type == "block":
+            self.object_usd_path = f"{self._assets_root_path}/Isaac/Props/Blocks/block_instanceable.usd"
+        else:
+            # self.object_usd_path = f"{self._assets_root_path}{YCB_DATASET_DIR}/{self.object_type}.usd"
+            self.object_usd_path = (
+                f"/home/user/Downloads/YCB/Axis_Aligned/{self.object_type}_instanceable_rigid_body.usd"
+            )
+            assert os.path.exists(self.object_usd_path), "Object usd path does not exist: {}".format(
+                self.object_usd_path
+            )
         add_reference_to_stage(self.object_usd_path, self.default_zero_env_path + "/object")
         obj = XFormPrim(
             prim_path=self.default_zero_env_path + "/object/object",
@@ -471,6 +591,8 @@ class GraspingTask(RLTask):
             self.max_consecutive_successes,
             self.av_factor,
         )
+
+        self.reset_buf[:] = 0
 
         self.extras["consecutive_successes"] = self.consecutive_successes.mean()
         self.randomization_buf += 1
