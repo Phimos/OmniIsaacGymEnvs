@@ -151,6 +151,79 @@ class GraspingTask(RLTask):
         self.object_pointcloud = pointcloud.to(self.device)
         self.num_points = num_points
 
+    #####################################################################
+    ###==================initialize simulator scenes==================###
+    #####################################################################
+
+    def get_hand(self):
+        hand_start_translation = torch.tensor([0.0, 0.0, 0.5], device=self.device)
+        hand_start_orientation = torch.tensor([0.70711, 0.70711, 0.0, 0.0], device=self.device)
+
+        shadow_hand = ShadowHand(
+            prim_path=self.default_zero_env_path + "/shadow_hand",
+            name="shadow_hand",
+            translation=hand_start_translation,
+            orientation=hand_start_orientation,
+        )
+        self._sim_config.apply_articulation_settings(
+            "shadow_hand",
+            get_prim_at_path(shadow_hand.prim_path),
+            self._sim_config.parse_actor_config("shadow_hand"),
+        )
+        shadow_hand.set_shadow_hand_properties(stage=self._stage, shadow_hand_prim=shadow_hand.prim)
+        shadow_hand.set_motor_control_mode(stage=self._stage, shadow_hand_path=shadow_hand.prim_path)
+        pose_dy, pose_dz = -0.39, 0.10
+        return hand_start_translation, pose_dy, pose_dz
+
+    def get_hand_view(self, scene: Scene):
+        hand_view = ShadowHandView(prim_paths_expr="/World/envs/.*/shadow_hand", name="shadow_hand_view")
+        scene.add(hand_view._fingers)
+        return hand_view
+
+    def get_object(self, hand_start_translation, pose_dy, pose_dz):
+        self.object_start_translation = hand_start_translation.clone()
+        self.object_start_translation[1] += pose_dy
+        self.object_start_translation[2] += pose_dz
+        self.object_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        if self.object_type == "block":
+            self.object_usd_path = f"{self._assets_root_path}/Isaac/Props/Blocks/block_instanceable.usd"
+        else:
+            # self.object_usd_path = f"{self._assets_root_path}{YCB_DATASET_DIR}/{self.object_type}.usd"
+            self.object_usd_path = (
+                f"/home/user/Downloads/YCB/Axis_Aligned/{self.object_type}_instanceable_rigid_body.usd"
+            )
+            assert os.path.exists(self.object_usd_path), "Object usd path does not exist: {}".format(
+                self.object_usd_path
+            )
+        add_reference_to_stage(self.object_usd_path, self.default_zero_env_path + "/object")
+        obj = XFormPrim(
+            prim_path=self.default_zero_env_path + "/object/object",
+            name="object",
+            translation=self.object_start_translation,
+            orientation=self.object_start_orientation,
+            scale=self.object_scale,
+        )
+        self._sim_config.apply_articulation_settings(
+            "object", get_prim_at_path(obj.prim_path), self._sim_config.parse_actor_config("object")
+        )
+
+    def get_goal(self):
+        self.goal_displacement_tensor = torch.tensor([-0.2, -0.06, 0.12], device=self.device)
+        self.goal_start_translation = self.object_start_translation + self.goal_displacement_tensor
+        self.goal_start_translation[2] -= 0.04
+        self.goal_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        add_reference_to_stage(self.object_usd_path, self.default_zero_env_path + "/goal")
+        goal = XFormPrim(
+            prim_path=self.default_zero_env_path + "/goal",
+            name="goal",
+            translation=self.goal_start_translation,
+            orientation=self.goal_start_orientation,
+            scale=self.object_scale,
+        )
+        self._sim_config.apply_articulation_settings(
+            "goal", get_prim_at_path(goal.prim_path), self._sim_config.parse_actor_config("goal_object")
+        )
+
     def set_up_scene(self, scene: Scene) -> None:
         scene.add_default_ground_plane()
 
@@ -183,30 +256,68 @@ class GraspingTask(RLTask):
         if self._dr_randomizer.randomize:
             self._dr_randomizer.apply_on_startup_domain_randomization(self)
 
-    def get_hand(self):
-        hand_start_translation = torch.tensor([0.0, 0.0, 0.5], device=self.device)
-        hand_start_orientation = torch.tensor([0.70711, 0.70711, 0.0, 0.0], device=self.device)
+    #####################################################################
+    ###=====================compute observations======================###
+    #####################################################################
 
-        shadow_hand = ShadowHand(
-            prim_path=self.default_zero_env_path + "/shadow_hand",
-            name="shadow_hand",
-            translation=hand_start_translation,
-            orientation=hand_start_orientation,
-        )
-        self._sim_config.apply_articulation_settings(
-            "shadow_hand",
-            get_prim_at_path(shadow_hand.prim_path),
-            self._sim_config.parse_actor_config("shadow_hand"),
-        )
-        shadow_hand.set_shadow_hand_properties(stage=self._stage, shadow_hand_prim=shadow_hand.prim)
-        shadow_hand.set_motor_control_mode(stage=self._stage, shadow_hand_path=shadow_hand.prim_path)
-        pose_dy, pose_dz = -0.39, 0.10
-        return hand_start_translation, pose_dy, pose_dz
+    def compute_fingertip_positions(self):
+        positions = self._hands._fingers.get_world_poses(clone=False)[0]
+        positions = positions.reshape(self.num_envs, self.num_fingertips, 3)
+        positions -= self._env_pos.reshape(self.num_envs, 1, 3)
+        return positions
 
-    def get_hand_view(self, scene: Scene):
-        hand_view = ShadowHandView(prim_paths_expr="/World/envs/.*/shadow_hand", name="shadow_hand_view")
-        scene.add(hand_view._fingers)
-        return hand_view
+    def compute_fingertip_rotations(self):
+        return self._hands._fingers.get_world_poses(clone=False)[1]
+
+    def compute_fingertip_velocities(self):
+        return self._hands._fingers.get_velocities(clone=False)
+
+    def compute_fingertip_object_minimum_distances(self):
+        object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
+        fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
+
+        # Compute distances between fingertip positions and object pointcloud
+        distances = torch.norm(object_pointcloud[:, None, :, :] - fingertip_positions[:, :, None, :], dim=-1)
+
+        # Find minimum distance for each fingertip and object
+        min_distances = distances.min(dim=2)[0]  # [num_envs, num_fingertips]
+
+        return min_distances
+
+    def compute_hand_joint_angles(self):
+        return self._hands.get_joint_positions(clone=False)
+
+    def compute_hand_joint_velocities(self):
+        return self._hands.get_joint_velocities(clone=False)
+
+    def compute_object_positions(self):
+        positions = self._objects.get_world_poses(clone=False)[0]
+        positions -= self._env_pos
+        return positions
+
+    def compute_object_rotations(self):
+        return self._objects.get_world_poses(clone=False)[1]
+
+    def compute_object_velocities(self):
+        return self._objects.get_velocities(clone=False)
+
+    def compute_object_linear_velocities(self):
+        return self._objects.get_linear_velocities(clone=False)
+
+    def compute_object_angular_velocities(self):
+        return self._objects.get_angular_velocities(clone=False)
+
+    def compute_object_pointcloud(self):
+        positions, rotations = self._objects.get_world_poses(clone=False)
+        pointcloud = self.object_pointcloud.clone()
+
+        pointcloud = pointcloud.reshape(1, -1, 3).repeat(self.num_envs, 1, 1).reshape(-1, 3)
+        rotations = rotations.reshape(-1, 1, 4).repeat(1, self.num_points, 1).reshape(-1, 4)
+
+        pointcloud = quat_rotate(rotations, pointcloud).reshape(self.num_envs, -1, 3)
+        pointcloud += positions.reshape(self.num_envs, 1, 3)
+        pointcloud -= self._env_pos.reshape(self.num_envs, 1, 3)
+        return pointcloud
 
     def get_observations(self):
         self.get_object_goal_observations()
@@ -285,69 +396,6 @@ class GraspingTask(RLTask):
             self.obs_buf[:, 81:85] = self.goal_rot
             self.obs_buf[:, 85:89] = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
             self.obs_buf[:, 89:109] = self.actions
-
-    #####################################################################
-    ###=====================compute observations======================###
-    #####################################################################
-
-    def compute_fingertip_positions(self):
-        positions = self._hands._fingers.get_world_poses(clone=False)[0]
-        positions = positions.reshape(self.num_envs, self.num_fingertips, 3)
-        positions -= self._env_pos.reshape(self.num_envs, 1, 3)
-        return positions
-
-    def compute_fingertip_rotations(self):
-        return self._hands._fingers.get_world_poses(clone=False)[1]
-
-    def compute_fingertip_velocities(self):
-        return self._hands._fingers.get_velocities(clone=False)
-
-    def compute_fingertip_object_minimum_distances(self):
-        object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
-        fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
-
-        # Compute distances between fingertip positions and object pointcloud
-        distances = torch.norm(object_pointcloud[:, None, :, :] - fingertip_positions[:, :, None, :], dim=-1)
-
-        # Find minimum distance for each fingertip and object
-        min_distances = distances.min(dim=2)[0]  # [num_envs, num_fingertips]
-
-        return min_distances
-
-    def compute_hand_joint_angles(self):
-        return self._hands.get_joint_positions(clone=False)
-
-    def compute_hand_joint_velocities(self):
-        return self._hands.get_joint_velocities(clone=False)
-
-    def compute_object_positions(self):
-        positions = self._objects.get_world_poses(clone=False)[0]
-        positions -= self._env_pos
-        return positions
-
-    def compute_object_rotations(self):
-        return self._objects.get_world_poses(clone=False)[1]
-
-    def compute_object_velocities(self):
-        return self._objects.get_velocities(clone=False)
-
-    def compute_object_linear_velocities(self):
-        return self._objects.get_linear_velocities(clone=False)
-
-    def compute_object_angular_velocities(self):
-        return self._objects.get_angular_velocities(clone=False)
-
-    def compute_object_pointcloud(self):
-        positions, rotations = self._objects.get_world_poses(clone=False)
-        pointcloud = self.object_pointcloud.clone()
-
-        pointcloud = pointcloud.reshape(1, -1, 3).repeat(self.num_envs, 1, 1).reshape(-1, 3)
-        rotations = rotations.reshape(-1, 1, 4).repeat(1, self.num_points, 1).reshape(-1, 4)
-
-        pointcloud = quat_rotate(rotations, pointcloud).reshape(self.num_envs, -1, 3)
-        pointcloud += positions.reshape(self.num_envs, 1, 3)
-        pointcloud -= self._env_pos.reshape(self.num_envs, 1, 3)
-        return pointcloud
 
     def compute_full_observations(self, no_vel=False):
         if no_vel:
@@ -472,50 +520,6 @@ class GraspingTask(RLTask):
             # obs_total = obs_end + num_actions = 187
             obs_end = fingertip_obs_start + num_ft_states + num_ft_force_torques
             self.obs_buf[:, obs_end : obs_end + self.num_actions] = self.actions
-
-    def get_object(self, hand_start_translation, pose_dy, pose_dz):
-        self.object_start_translation = hand_start_translation.clone()
-        self.object_start_translation[1] += pose_dy
-        self.object_start_translation[2] += pose_dz
-        self.object_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-        if self.object_type == "block":
-            self.object_usd_path = f"{self._assets_root_path}/Isaac/Props/Blocks/block_instanceable.usd"
-        else:
-            # self.object_usd_path = f"{self._assets_root_path}{YCB_DATASET_DIR}/{self.object_type}.usd"
-            self.object_usd_path = (
-                f"/home/user/Downloads/YCB/Axis_Aligned/{self.object_type}_instanceable_rigid_body.usd"
-            )
-            assert os.path.exists(self.object_usd_path), "Object usd path does not exist: {}".format(
-                self.object_usd_path
-            )
-        add_reference_to_stage(self.object_usd_path, self.default_zero_env_path + "/object")
-        obj = XFormPrim(
-            prim_path=self.default_zero_env_path + "/object/object",
-            name="object",
-            translation=self.object_start_translation,
-            orientation=self.object_start_orientation,
-            scale=self.object_scale,
-        )
-        self._sim_config.apply_articulation_settings(
-            "object", get_prim_at_path(obj.prim_path), self._sim_config.parse_actor_config("object")
-        )
-
-    def get_goal(self):
-        self.goal_displacement_tensor = torch.tensor([-0.2, -0.06, 0.12], device=self.device)
-        self.goal_start_translation = self.object_start_translation + self.goal_displacement_tensor
-        self.goal_start_translation[2] -= 0.04
-        self.goal_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-        add_reference_to_stage(self.object_usd_path, self.default_zero_env_path + "/goal")
-        goal = XFormPrim(
-            prim_path=self.default_zero_env_path + "/goal",
-            name="goal",
-            translation=self.goal_start_translation,
-            orientation=self.goal_start_orientation,
-            scale=self.object_scale,
-        )
-        self._sim_config.apply_articulation_settings(
-            "goal", get_prim_at_path(goal.prim_path), self._sim_config.parse_actor_config("goal_object")
-        )
 
     def post_reset(self):
         self.num_hand_dofs = self._hands.num_dof
