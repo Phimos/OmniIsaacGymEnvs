@@ -14,6 +14,8 @@ from omni.isaac.core.utils.prims import get_prim_at_path
 from omni.isaac.core.utils.stage import add_reference_to_stage, get_current_stage
 from omni.isaac.core.utils.torch import *
 from omni.isaac.gym.vec_env import VecEnvBase
+from omni.isaac.sensor.scripts.camera import Camera
+from omni.isaac.utils.scripts.camera_utils import DynamicCamera
 
 from omniisaacgymenvs.robots.articulations.shadow_hand import ShadowHand
 from omniisaacgymenvs.robots.articulations.views.shadow_hand_view import ShadowHandView
@@ -224,6 +226,26 @@ class GraspingTask(RLTask):
             "goal", get_prim_at_path(goal.prim_path), self._sim_config.parse_actor_config("goal_object")
         )
 
+    def get_cameras(self):
+        camera_position = torch.tensor([-0.5, 0.0, 0.5], device=self.device)
+        camera_rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        camera = Camera(
+            prim_path=self.default_zero_env_path + "/camera",
+            name="camera",
+            resolution=(640, 480),
+            translation=camera_position,
+            orientation=camera_rotation,
+        )
+        camera.add_distance_to_camera_to_frame()
+        camera.add_pointcloud_to_frame()
+        camera.set_dt(self.dt)
+
+        self._camera = camera
+
+        # camera = DynamicCamera(
+        #     stage=self._stage, base_path=self.default_zero_env_path + "/camera", camera_name="camera"
+        # )
+
     def set_up_scene(self, scene: Scene) -> None:
         scene.add_default_ground_plane()
 
@@ -232,6 +254,8 @@ class GraspingTask(RLTask):
         hand_start_translation, pose_dy, pose_dz = self.get_hand()
         self.get_object(hand_start_translation, pose_dy, pose_dz)
         self.get_goal()
+
+        # self.get_cameras()
 
         replicate_physics = False if self._dr_randomizer.randomize else True
         super().set_up_scene(scene, replicate_physics)
@@ -252,6 +276,8 @@ class GraspingTask(RLTask):
         )
         self._goals._non_root_link = True  # hack to ignore kinematics
         scene.add(self._goals)
+
+        # self._camera.initialize()
 
         if self._dr_randomizer.randomize:
             self._dr_randomizer.apply_on_startup_domain_randomization(self)
@@ -319,6 +345,10 @@ class GraspingTask(RLTask):
         pointcloud -= self._env_pos.reshape(self.num_envs, 1, 3)
         return pointcloud
 
+    #####################################################################
+    ###=====================RL pipeline functions=====================###
+    #####################################################################
+
     def get_observations(self):
         self.get_object_goal_observations()
 
@@ -341,6 +371,8 @@ class GraspingTask(RLTask):
         # minimum_distance = self.compute_fingertip_object_minimum_distances()
         # print(minimum_distance)
         # print(minimum_distance.shape)
+
+        # print(self._camera.get_current_frame())
 
         self.hand_dof_pos = self._hands.get_joint_positions(clone=False)
         self.hand_dof_vel = self._hands.get_joint_velocities(clone=False)
