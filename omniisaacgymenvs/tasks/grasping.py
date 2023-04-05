@@ -596,6 +596,9 @@ class GraspingTask(RLTask):
         # Allocate tensors for storing joint targets
         self._init_dof_positions = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
         self._init_dof_velocities = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+        # TODO: consider init object positions and orientations
+        self._init_object_positions = torch.tensor([1.0, 0.1, 1.0], dtype=torch.float, device=self.device)
+        self._init_object_orientations = torch.tensor([1, 0, 0, 0], dtype=torch.float, device=self.device)
         self._prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._current_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
 
@@ -611,22 +614,22 @@ class GraspingTask(RLTask):
             self._dr_randomizer.set_up_domain_randomization(self)
 
         return
-        self.num_hand_dofs = self._hands.num_dof
-        self.actuated_dof_indices = self._hands.actuated_dof_indices
+        # self.num_hand_dofs = self._hands.num_dof
+        # self.actuated_dof_indices = self._hands.actuated_dof_indices
 
         self.hand_dof_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
 
-        self.prev_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
-        self.cur_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
+        # self.prev_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
+        # self.cur_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
 
-        dof_limits = self._hands.get_dof_limits()
-        self.hand_dof_lower_limits, self.hand_dof_upper_limits = torch.t(dof_limits[0].to(self.device))
+        # dof_limits = self._hands.get_dof_limits()
+        # self.hand_dof_lower_limits, self.hand_dof_upper_limits = torch.t(dof_limits[0].to(self.device))
 
-        self.hand_dof_default_pos = torch.zeros(self.num_hand_dofs, dtype=torch.float, device=self.device)
-        self.hand_dof_default_vel = torch.zeros(self.num_hand_dofs, dtype=torch.float, device=self.device)
+        # self.hand_dof_default_pos = torch.zeros(self.num_hand_dofs, dtype=torch.float, device=self.device)
+        # self.hand_dof_default_vel = torch.zeros(self.num_hand_dofs, dtype=torch.float, device=self.device)
 
-        self.object_init_pos, self.object_init_rot = self._objects.get_world_poses()
-        self.object_init_pos -= self._env_pos
+        # self.object_init_pos, self.object_init_rot = self._objects.get_world_poses()
+        # self.object_init_pos -= self._env_pos
         self.object_init_velocities = torch.zeros_like(
             self._objects.get_velocities(), dtype=torch.float, device=self.device
         )
@@ -639,11 +642,11 @@ class GraspingTask(RLTask):
         self.goal_init_rot = self.goal_rot.clone()
 
         # randomize all envs
-        indices = torch.arange(self._num_envs, dtype=torch.int64, device=self._device)
-        self.reset_idx(indices)
+        # indices = torch.arange(self._num_envs, dtype=torch.int64, device=self._device)
+        # self.reset_idx(indices)
 
-        if self._dr_randomizer.randomize:
-            self._dr_randomizer.set_up_domain_randomization(self)
+        # if self._dr_randomizer.randomize:
+        #     self._dr_randomizer.set_up_domain_randomization(self)
 
     def reset_envs_by_indices(self, indices: Optional[torch.Tensor] = None):
         if indices is None:
@@ -652,7 +655,15 @@ class GraspingTask(RLTask):
         indices = indices.to(dtype=torch.long).to(self.device)
         assert indices.min() >= 0 and indices.max() < self.num_envs, "Invalid indices"
 
-        # TODO: reset object pose
+        # TODO: random object orientation
+        noise = torch.rand(indices.shape[0], 3, device=self.device)
+        noise = noise * self.reset_position_noise
+        object_positions = self._init_object_positions + self._env_pos[indices] + noise
+        object_orientations = self._init_object_orientations[None, :].repeat(indices.shape[0], 1)
+        object_velocities = torch.zeros(indices.shape[0], 6, device=self.device)
+
+        self._objects.set_world_poses(object_positions, object_orientations, indices)
+        self._objects.set_velocities(object_velocities, indices)
 
         # Add randomization to joint positions & velocities
         # TODO: reconsider the randomization & robot init pose
@@ -675,72 +686,8 @@ class GraspingTask(RLTask):
         self._current_targets[indices] = joint_positions
 
         self.progress_buf[indices] = 0
-
-    def reset_target_pose(self, env_ids):
-        # reset goal
-        indices = env_ids.to(dtype=torch.int32)
-        rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), 4), device=self.device)
-
-        new_rot = randomize_rotation(
-            rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids]
-        )
-
-        self.goal_pos[env_ids] = self.goal_init_pos[env_ids, 0:3]
-        self.goal_rot[env_ids] = new_rot
-
-        goal_pos, goal_rot = self.goal_pos.clone(), self.goal_rot.clone()
-        goal_pos[env_ids] = (
-            self.goal_pos[env_ids] + self.goal_displacement_tensor + self._env_pos[env_ids]
-        )  # add world env pos
-
-        self._goals.set_world_poses(goal_pos[env_ids], goal_rot[env_ids], indices)
-        self.reset_goal_buf[env_ids] = 0
-
-    def reset_idx(self, env_ids: torch.Tensor):
-        indices = env_ids.to(dtype=torch.int32)
-        rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), self.num_hand_dofs * 2 + 5), device=self.device)
-
-        self.reset_target_pose(env_ids)
-
-        # reset object
-        new_object_pos = (
-            self.object_init_pos[env_ids] + self.reset_position_noise * rand_floats[:, 0:3] + self._env_pos[env_ids]
-        )  # add world env pos
-
-        new_object_rot = randomize_rotation(
-            rand_floats[:, 3], rand_floats[:, 4], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids]
-        )
-
-        object_velocities = torch.zeros_like(self.object_init_velocities, dtype=torch.float, device=self.device)
-        self._objects.set_velocities(object_velocities[env_ids], indices)
-        self._objects.set_world_poses(new_object_pos, new_object_rot, indices)
-
-        # reset hand
-        delta_max = self.hand_dof_upper_limits - self.hand_dof_default_pos
-        delta_min = self.hand_dof_lower_limits - self.hand_dof_default_pos
-        rand_delta = delta_min + (delta_max - delta_min) * 0.5 * (rand_floats[:, 5 : 5 + self.num_hand_dofs] + 1.0)
-
-        pos = self.hand_dof_default_pos + self.reset_dof_pos_noise * rand_delta
-        dof_pos = torch.zeros((self.num_envs, self.num_hand_dofs), device=self.device)
-        dof_pos[env_ids, :] = pos
-
-        dof_vel = torch.zeros((self.num_envs, self.num_hand_dofs), device=self.device)
-        dof_vel[env_ids, :] = (
-            self.hand_dof_default_vel
-            + self.reset_dof_vel_noise * rand_floats[:, 5 + self.num_hand_dofs : 5 + self.num_hand_dofs * 2]
-        )
-
-        self.prev_targets[env_ids, : self.num_hand_dofs] = pos
-        self.cur_targets[env_ids, : self.num_hand_dofs] = pos
-        self.hand_dof_targets[env_ids, :] = pos
-
-        self._hands.set_joint_position_targets(self.hand_dof_targets[env_ids], indices)
-        self._hands.set_joint_positions(dof_pos[env_ids], indices)
-        self._hands.set_joint_velocities(dof_vel[env_ids], indices)
-
-        self.progress_buf[env_ids] = 0
-        self.reset_buf[env_ids] = 0
-        self.successes[env_ids] = 0
+        self.reset_buf[indices] = 0
+        self.successes[indices] = 0
 
     def get_observations(self):
         # print(self._robots._fingertips.get_world_poses())
