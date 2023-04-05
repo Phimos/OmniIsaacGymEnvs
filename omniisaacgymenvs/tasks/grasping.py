@@ -400,8 +400,9 @@ class GraspingTask(RLTask):
 
     def create_object(self):
         self.object_start_translation = torch.tensor([0.0, 0.0, 0.5], device=self.device)
-        self.object_start_translation[1] += -0.49
-        self.object_start_translation[2] += 0.10
+        self.object_start_translation[0] += 1.05
+        self.object_start_translation[1] += 0.15
+        self.object_start_translation[2] += 0.5
         self.object_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
 
         self.object_usd_path = self.get_object_usd_path()
@@ -592,17 +593,22 @@ class GraspingTask(RLTask):
         self.num_dofs = self._robots.num_dof
         self.actuated_dof_indices = self._robots.actuated_dof_indices
 
-        # Create buffer for storing previous actions
+        # Allocate tensors for storing joint targets
+        self._init_dof_positions = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+        self._init_dof_velocities = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
         self._prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._current_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
 
-        # Set arm to initial joint positions
-        joint_positions = self._robots.get_joint_positions()
-        joint_positions[:, self._robots.arm_dof_indices] = self.arm_init_joint_positions
-        self._robots.set_joint_positions(joint_positions)
+        self._init_dof_positions[self._robots.arm_dof_indices] = self.arm_init_joint_positions
 
+        # Get joint limits
         dof_limits = self._robots.get_dof_limits()
         self._dof_lower_limits, self._dof_upper_limits = torch.t(dof_limits[0].to(self.device))
+
+        self.reset_envs_by_indices()
+
+        if self._dr_randomizer.randomize:
+            self._dr_randomizer.set_up_domain_randomization(self)
 
         return
         self.num_hand_dofs = self._hands.num_dof
@@ -638,6 +644,37 @@ class GraspingTask(RLTask):
 
         if self._dr_randomizer.randomize:
             self._dr_randomizer.set_up_domain_randomization(self)
+
+    def reset_envs_by_indices(self, indices: Optional[torch.Tensor] = None):
+        if indices is None:
+            indices = torch.arange(self.num_envs)
+
+        indices = indices.to(dtype=torch.long).to(self.device)
+        assert indices.min() >= 0 and indices.max() < self.num_envs, "Invalid indices"
+
+        # TODO: reset object pose
+
+        # Add randomization to joint positions & velocities
+        # TODO: reconsider the randomization & robot init pose
+        delta_upper = self._dof_upper_limits - self._init_dof_positions
+        delta_lower = self._dof_lower_limits - self._init_dof_positions
+        noise = torch.rand(indices.shape[0], self.num_dofs, device=self.device)
+        noise = noise * (delta_upper - delta_lower) + delta_lower
+        joint_positions = self._init_dof_positions + noise * self.reset_dof_pos_noise / 10.0
+
+        noise = torch.rand(indices.shape[0], self.num_dofs, device=self.device)
+        joint_velocities = self._init_dof_velocities + noise * self.reset_dof_vel_noise
+
+        # Set joint positions & velocities
+        self._robots.set_joint_position_targets(joint_positions, indices)
+        self._robots.set_joint_positions(joint_positions, indices)
+        self._robots.set_joint_velocities(joint_velocities, indices)
+
+        # Reset related buffers
+        self._prev_targets[indices] = joint_positions
+        self._current_targets[indices] = joint_positions
+
+        self.progress_buf[indices] = 0
 
     def reset_target_pose(self, env_ids):
         # reset goal
@@ -706,7 +743,7 @@ class GraspingTask(RLTask):
         self.successes[env_ids] = 0
 
     def get_observations(self):
-        print(self._robots._fingertips.get_world_poses())
+        # print(self._robots._fingertips.get_world_poses())
         pass
 
     def calculate_metrics(self):
@@ -714,6 +751,10 @@ class GraspingTask(RLTask):
 
     def is_done(self):
         pass
+
+    def pre_physics_step(self, actions):
+        if not self._env._world.is_playing():
+            return
 
 
 #####################################################################
