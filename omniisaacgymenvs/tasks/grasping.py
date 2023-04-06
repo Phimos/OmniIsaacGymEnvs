@@ -1,13 +1,15 @@
 import math
 from abc import abstractmethod
 from pdb import set_trace
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import omni.replicator.isaac as dr
 import open3d as o3d
 import torch
 import torch.nn.functional as F
+from omni.isaac.core.articulations import ArticulationView
+from omni.isaac.core.objects import DynamicCuboid, FixedCuboid
 from omni.isaac.core.prims import RigidContactView, RigidPrim, RigidPrimView, XFormPrim
 from omni.isaac.core.robots.robot import Robot
 from omni.isaac.core.robots.robot_view import RobotView
@@ -20,7 +22,6 @@ from omni.isaac.gym.vec_env import VecEnvBase
 from omni.isaac.sensor.scripts.camera import Camera
 from omni.isaac.utils.scripts.camera_utils import DynamicCamera
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
-from typing import List, Optional, Tuple
 
 from omniisaacgymenvs.robots.articulations.shadow_hand_ur10e import ShadowHandUR10e
 from omniisaacgymenvs.robots.articulations.views.shadow_hand_ur10e_view import ShadowHandUR10eView
@@ -124,20 +125,23 @@ class ShadowHand(Robot):
             )
 
 
-class ShadowHandView(RobotView):
+class ShadowHandView(ArticulationView):
     def __init__(
         self,
         prim_paths_expr: str,
         name: Optional[str] = "RobotView",
     ):
-        super().__init__(
-            prim_paths_expr=prim_paths_expr,
-            name=name,
-        )
+        super().__init__(prim_paths_expr=prim_paths_expr, name=name, reset_xform_properties=False)
 
         self._fingertips = RigidPrimView(
             prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*distal",
             name="FingertipView",
+            reset_xform_properties=False,
+        )
+
+        self._wrists = RigidPrimView(
+            prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*wrist",
+            name="WristView",
             reset_xform_properties=False,
         )
 
@@ -252,8 +256,9 @@ class GraspingTask(RLTask):
         if self.asymmetric_obs:
             num_states = 187
 
-        self._num_observations = self.num_obs_dict[self.obs_type]
-        self._num_actions = 20
+        # self._num_observations = self.num_obs_dict[self.obs_type]
+        self._num_observations = 100
+        self._num_actions = 26
         self._num_states = num_states
 
         self._num_envs = self._task_cfg["env"]["numEnvs"]
@@ -350,7 +355,7 @@ class GraspingTask(RLTask):
         robot = ShadowHand(prim_path=self.default_zero_env_path + "/robot", name="robot", usd_path=robot_usd_path)
         print(robot.prim_path + "/robot/shadow_hand")
         self._sim_config.apply_articulation_settings(
-            "shadow_hand",
+            "robot",
             get_prim_at_path(robot.prim_path + "/robot"),
             self._sim_config.parse_actor_config("shadow_hand"),
         )
@@ -358,10 +363,21 @@ class GraspingTask(RLTask):
 
     def create_isaac_robot_view(self, scene: Scene):
         robot_view = ShadowHandView(prim_paths_expr="/World/envs/env_.*/robot/robot", name="robot_view")
+        scene.add(robot_view._fingertips)
+        scene.add(robot_view._wrists)
         return robot_view
 
     def create_table(self):
-        pass
+        translation = torch.tensor([1.2, 0.0, 0.05], device=self.device)
+        orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        scale = torch.tensor([1.0, 1.2, 0.1], device=self.device)
+        table = FixedCuboid(
+            prim_path=self.default_zero_env_path + "/table",
+            name="table",
+            translation=translation,
+            orientation=orientation,
+            scale=scale,
+        )
 
     def create_shadowhand(self, translation: Optional[torch.Tensor] = None, orientation: Optional[torch.Tensor] = None):
         translation = torch.tensor([0.0, 0.0, 0.5], device=self.device) if translation is None else translation
@@ -399,10 +415,7 @@ class GraspingTask(RLTask):
             return f"{user_assets_root_path}/{self.object_type}_instanceable_rigid_body.usd"
 
     def create_object(self):
-        self.object_start_translation = torch.tensor([0.0, 0.0, 0.5], device=self.device)
-        self.object_start_translation[0] += 1.05
-        self.object_start_translation[1] += 0.15
-        self.object_start_translation[2] += 0.5
+        self.object_start_translation = torch.tensor([1.3, 0.2, 0.2], device=self.device)
         self.object_start_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
 
         self.object_usd_path = self.get_object_usd_path()
@@ -475,6 +488,7 @@ class GraspingTask(RLTask):
         self._stage = get_current_stage()
 
         self.create_isaac_robot()
+        self.create_table()
         self.create_object()
         self.create_goal()
 
@@ -497,17 +511,25 @@ class GraspingTask(RLTask):
     ###==================== Compute Observations =====================###
     #####################################################################
 
+    def compute_wrist_positions(self):
+        positions = self._robots._wrists.get_world_poses(clone=False)[0]
+        positions -= self._env_pos
+        return positions
+
+    def compute_wrist_rotations(self):
+        return self._robots._wrists.get_world_poses(clone=False)[1]
+
     def compute_fingertip_positions(self):
-        positions = self._hands._fingers.get_world_poses(clone=False)[0]
+        positions = self._robots._fingertips.get_world_poses(clone=False)[0]
         positions = positions.reshape(self.num_envs, self.num_fingertips, 3)
         positions -= self._env_pos.reshape(self.num_envs, 1, 3)
         return positions
 
     def compute_fingertip_rotations(self):
-        return self._hands._fingers.get_world_poses(clone=False)[1]
+        return self._robots._fingertips.get_world_poses(clone=False)[1]
 
     def compute_fingertip_velocities(self):
-        return self._hands._fingers.get_velocities(clone=False)
+        return self._robots._fingertips.get_velocities(clone=False)
 
     def compute_fingertip_object_minimum_distances(self):
         object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
@@ -521,11 +543,11 @@ class GraspingTask(RLTask):
 
         return min_distances
 
-    def compute_hand_joint_angles(self):
-        return self._hands.get_joint_positions(clone=False)
+    def compute_joint_positions(self):
+        return self._robots.get_joint_positions(clone=False)
 
-    def compute_hand_joint_velocities(self):
-        return self._hands.get_joint_velocities(clone=False)
+    def compute_joint_velocities(self):
+        return self._robots.get_joint_velocities(clone=False)
 
     def compute_object_positions(self):
         positions = self._objects.get_world_poses(clone=False)[0]
@@ -597,16 +619,21 @@ class GraspingTask(RLTask):
         self._init_dof_positions = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
         self._init_dof_velocities = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
         # TODO: consider init object positions and orientations
-        self._init_object_positions = torch.tensor([1.0, 0.1, 1.0], dtype=torch.float, device=self.device)
+        self._init_object_positions = torch.tensor([1.3, 0.1, 0.2], dtype=torch.float, device=self.device)
         self._init_object_orientations = torch.tensor([1, 0, 0, 0], dtype=torch.float, device=self.device)
         self._prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._current_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+
+        self._wrist_object_distances = torch.zeros((self.num_envs), dtype=torch.float, device=self.device)
 
         self._init_dof_positions[self._robots.arm_dof_indices] = self.arm_init_joint_positions
 
         # Get joint limits
         dof_limits = self._robots.get_dof_limits()
         self._dof_lower_limits, self._dof_upper_limits = torch.t(dof_limits[0].to(self.device))
+
+        # TODO: reset goal object
+        pass
 
         self.reset_envs_by_indices()
 
@@ -685,23 +712,112 @@ class GraspingTask(RLTask):
         self._prev_targets[indices] = joint_positions
         self._current_targets[indices] = joint_positions
 
+        # Reset other buffers
+        distances = torch.norm(self.compute_wrist_positions() - self.compute_object_positions(), dim=1)
+        self._wrist_object_distances[indices] = distances[indices]
+
         self.progress_buf[indices] = 0
         self.reset_buf[indices] = 0
         self.successes[indices] = 0
 
     def get_observations(self):
-        # print(self._robots._fingertips.get_world_poses())
-        pass
+        fingertip_positions = self.compute_fingertip_positions()
+        fingertip_positions = fingertip_positions.reshape(self.num_envs, -1)
+
+        object_positions = self.compute_object_positions()
+        object_positions = object_positions.reshape(self.num_envs, -1)
+
+        object_rotations = self.compute_object_rotations()
+        object_rotations = object_rotations.reshape(self.num_envs, -1)
+
+        minimum_distances = self.compute_fingertip_object_minimum_distances()
+        minimum_distances = minimum_distances.reshape(self.num_envs, -1)
+
+        joint_positions = self.compute_joint_positions()
+        joint_positions = joint_positions.reshape(self.num_envs, -1)
+
+        joint_velocities = self.compute_joint_velocities()
+        joint_velocities = joint_velocities.reshape(self.num_envs, -1)
+
+        observations = torch.cat(
+            [
+                fingertip_positions,
+                object_positions,
+                object_rotations,
+                minimum_distances,
+                joint_positions,
+                joint_velocities,
+            ],
+            dim=-1,
+        )
+
+        self.obs_buf[:, : observations.shape[1]] = observations
+
+        return self.obs_buf
+
+    def get_states(self):
+        return self.states_buf
 
     def calculate_metrics(self):
-        pass
+        distances = torch.norm(self.compute_wrist_positions() - self.compute_object_positions(), dim=1)
+        self.rew_buf[:] = self._wrist_object_distances - distances
+        self._wrist_object_distances[:] = distances
+
+        # print("wrist:", self.compute_wrist_positions())
+        # print("object:", self.compute_object_positions())
+
+        # print("fingertip:", self.compute_fingertip_positions())
+
+        # print("distance:", distances)
+
+        reset_buf = self.reset_buf.clone()
+        progress_buf = self.progress_buf.clone()
+        resets = torch.where(distances >= 0.75, 1, reset_buf)
+        resets = torch.where(distances < 0.10, 1, resets)
+        resets = torch.where(progress_buf >= self.max_episode_length, 1, resets)
+        # print("progress:", progress_buf)
+
+        self.reset_buf[:] = resets
+        # print("resets:", resets)
 
     def is_done(self):
         pass
 
-    def pre_physics_step(self, actions):
+    def pre_physics_step(self, actions: torch.Tensor):
         if not self._env._world.is_playing():
             return
+
+        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        # goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
+
+        reset_buf = self.reset_buf.clone()
+
+        # if only goals need reset, then call set API
+        # if len(goal_env_ids) > 0 and len(env_ids) == 0:
+        # self.reset_target_pose(goal_env_ids)
+        # elif len(goal_env_ids) > 0:
+        # self.reset_target_pose(goal_env_ids)
+        if len(env_ids) > 0:
+            self.reset_envs_by_indices(env_ids)
+
+        actions = actions.clone().detach().to(self.device)
+
+        targets = self.compute_joint_targets(actions)
+        self._robots.set_joint_position_targets(
+            targets[:, self.actuated_dof_indices],
+            indices=None,
+            joint_indices=self.actuated_dof_indices,
+        )
+
+        if self._dr_randomizer.randomize:
+            rand_envs = torch.where(
+                self.randomization_buf >= self._dr_randomizer.min_frequency,
+                torch.ones_like(self.randomization_buf),
+                torch.zeros_like(self.randomization_buf),
+            )
+            rand_env_ids = torch.nonzero(torch.logical_and(rand_envs, reset_buf))
+            dr.physics_view.step_randomization(rand_env_ids)
+            self.randomization_buf[rand_env_ids] = 0
 
 
 #####################################################################
@@ -791,3 +907,10 @@ def compute_hand_reward(
     )
 
     return reward, resets, goal_resets, progress_buf, successes, cons_successes
+
+
+def random_points_on_hypersphere(n_points, n_dim, device):
+    """Sample points uniformly from the surface of an n-dimensional hypersphere."""
+    points = torch.randn(n_points, n_dim, device=device)
+    points = points / torch.norm(points, dim=-1, keepdim=True)
+    return points
