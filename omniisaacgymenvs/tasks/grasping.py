@@ -289,6 +289,10 @@ class GraspingTask(RLTask):
         self.max_consecutive_successes = self._task_cfg["env"]["maxConsecutiveSuccesses"]
         self.av_factor = self._task_cfg["env"].get("averFactor", 0.1)
 
+        self.table_length = self._task_cfg["env"].get("tableLength", 1.0)
+        self.table_width = self._task_cfg["env"].get("tableWidth", 1.2)
+        self.table_height = self._task_cfg["env"].get("tableHeight", 0.1)
+
         self.dt = 1.0 / 60
         control_freq_inv = self._task_cfg["env"].get("controlFrequencyInv", 1)
         if self.reset_time > 0.0:
@@ -368,9 +372,9 @@ class GraspingTask(RLTask):
         return robot_view
 
     def create_table(self):
-        translation = torch.tensor([1.2, 0.0, 0.05], device=self.device)
+        translation = torch.tensor([1.0, 0.0, 0.05], device=self.device)
         orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-        scale = torch.tensor([1.0, 1.2, 0.1], device=self.device)
+        scale = torch.tensor([self.table_length, self.table_width, self.table_height], device=self.device)
         table = FixedCuboid(
             prim_path=self.default_zero_env_path + "/table",
             name="table",
@@ -511,27 +515,86 @@ class GraspingTask(RLTask):
     ###==================== Compute Observations =====================###
     #####################################################################
 
-    def compute_palm_positions(self):
+    def compute_palm_positions(self) -> torch.Tensor:
+        """Compute the positions of the palms.
+
+        Returns:
+            torch.Tensor: [num_envs, 3]
+        """
         positions = self._robots._palms.get_world_poses(clone=False)[0]
         positions -= self._env_pos
         return positions
 
-    def compute_palm_rotations(self):
+    def compute_palm_rotations(self) -> torch.Tensor:
+        """Compute the rotations of the palms. (quaternions - wxyz)
+
+        Returns:
+            torch.Tensor: [num_envs, 4]
+        """
         return self._robots._palms.get_world_poses(clone=False)[1]
 
-    def compute_fingertip_positions(self):
+    def compute_fingertip_positions(self) -> torch.Tensor:
+        """Compute the positions of the fingertips.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 3]
+        """
         positions = self._robots._fingertips.get_world_poses(clone=False)[0]
         positions = positions.reshape(self.num_envs, self.num_fingertips, 3)
         positions -= self._env_pos.reshape(self.num_envs, 1, 3)
         return positions
 
-    def compute_fingertip_rotations(self):
-        return self._robots._fingertips.get_world_poses(clone=False)[1]
+    def compute_fingertip_rotations(self) -> torch.Tensor:
+        """Compute the rotations of the fingertips.
 
-    def compute_fingertip_velocities(self):
-        return self._robots._fingertips.get_velocities(clone=False)
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 4]
+        """
+        rotations = self._robots._fingertips.get_world_poses(clone=False)[1]
+        return rotations.reshape(self.num_envs, self.num_fingertips, 4)
 
-    def compute_fingertip_object_minimum_distances(self):
+    def compute_fingertip_velocities(self) -> torch.Tensor:
+        """Compute the velocities of the fingertips. (linear and angular)
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 6]
+        """
+        velocities = self._robots._fingertips.get_velocities(clone=False)
+        return velocities.reshape(self.num_envs, self.num_fingertips, 6)
+
+    def compute_fingertip_linear_velocities(self) -> torch.Tensor:
+        """Compute the linear velocities of the fingertips.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 3]
+        """
+        velocities = self._robots._fingertips.get_linear_velocities(clone=False)
+        return velocities.reshape(self.num_envs, self.num_fingertips, 3)
+
+    def compute_fingertip_angular_velocities(self) -> torch.Tensor:
+        """Compute the angular velocities of the fingertips.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 3]
+        """
+        velocities = self._robots._fingertips.get_angular_velocities(clone=False)
+        return velocities.reshape(self.num_envs, self.num_fingertips, 3)
+
+    def compute_fingertip_contact_forces(self) -> torch.Tensor:
+        """Compute the contact forces of the fingertips.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips, 3]
+        """
+        forces = self._robots._fingertips.get_net_contact_forces(clone=False)
+        return forces.reshape(self.num_envs, self.num_fingertips, 3)
+
+    def compute_fingertip_object_minimum_distances(self) -> torch.Tensor:
+        """Compute the minimum distance between each fingertip and the object pointcloud.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips]
+        """
         object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
         fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
 
@@ -543,30 +606,86 @@ class GraspingTask(RLTask):
 
         return min_distances
 
-    def compute_joint_positions(self):
+    def compute_fingertip_object_distances(self) -> torch.Tensor:
+        """Compute the distance between each fingertip and the object.
+
+        Returns:
+            torch.Tensor: [num_envs, num_fingertips]
+        """
+        object_positions = self.compute_object_positions()  # [num_envs, 3]
+        fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
+
+        # Compute distances between fingertip positions and object positions
+        distances = torch.norm(object_positions[:, None, :] - fingertip_positions, dim=-1)  # [num_envs, num_fingertips]
+
+        return distances
+
+    def compute_joint_positions(self) -> torch.Tensor:
+        """Compute the joint positions of the robot.
+
+        Returns:
+            torch.Tensor: [num_envs, num_dofs]
+        """
         return self._robots.get_joint_positions(clone=False)
 
-    def compute_joint_velocities(self):
+    def compute_joint_velocities(self) -> torch.Tensor:
+        """Compute the joint velocities of the robot.
+
+        Returns:
+            torch.Tensor: [num_envs, num_dofs]
+        """
         return self._robots.get_joint_velocities(clone=False)
 
-    def compute_object_positions(self):
+    def compute_object_positions(self) -> torch.Tensor:
+        """Compute the positions of the object.
+
+        Returns:
+            torch.Tensor: [num_envs, 3]
+        """
         positions = self._objects.get_world_poses(clone=False)[0]
         positions -= self._env_pos
         return positions
 
-    def compute_object_rotations(self):
+    def compute_object_rotations(self) -> torch.Tensor:
+        """Compute the rotations of the object. (quaternions - wxyz)
+
+        Returns:
+            torch.Tensor: [num_envs, 4]
+        """
         return self._objects.get_world_poses(clone=False)[1]
 
-    def compute_object_velocities(self):
+    def compute_object_velocities(self) -> torch.Tensor:
+        """Compute the velocities of the object. (linear and angular)
+
+        Returns:
+            torch.Tensor: [num_envs, 6]
+        """
         return self._objects.get_velocities(clone=False)
 
-    def compute_object_linear_velocities(self):
+    def compute_object_linear_velocities(self) -> torch.Tensor:
+        """Compute the linear velocities of the object.
+
+        Returns:
+            torch.Tensor: [num_envs, 3]
+        """
         return self._objects.get_linear_velocities(clone=False)
 
-    def compute_object_angular_velocities(self):
+    def compute_object_angular_velocities(self) -> torch.Tensor:
+        """Compute the angular velocities of the object.
+
+        Returns:
+            torch.Tensor: [num_envs, 3]
+        """
         return self._objects.get_angular_velocities(clone=False)
 
-    def compute_object_pointcloud(self):
+    def compute_object_pointcloud(self) -> torch.Tensor:
+        """Compute the pointcloud of the object.
+
+        The object pointcloud should be loaded from the object's mesh file.
+
+        Returns:
+            torch.Tensor: [num_envs, num_points, 3]
+        """
         positions, rotations = self._objects.get_world_poses(clone=False)
         pointcloud = self.object_pointcloud.clone()
 
@@ -623,6 +742,7 @@ class GraspingTask(RLTask):
         self._init_object_orientations = torch.tensor([1, 0, 0, 0], dtype=torch.float, device=self.device)
         self._prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._current_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self._actions = torch.zeros((self.num_envs, self.num_actions), dtype=torch.float, device=self.device)
 
         self._palm_object_distances = torch.zeros((self.num_envs), dtype=torch.float, device=self.device)
 
@@ -686,6 +806,10 @@ class GraspingTask(RLTask):
         noise = torch.rand(indices.shape[0], 3, device=self.device)
         noise = noise * self.reset_position_noise
         object_positions = self._init_object_positions + self._env_pos[indices] + noise
+        x_noise = uniform((indices.shape[0], 1), min_val=-0.2, max_val=0.2, device=self.device)
+        object_positions[:, 0] += x_noise[:, 0]
+        y_noise = uniform((indices.shape[0], 1), min_val=-0.3, max_val=0.3, device=self.device)
+        object_positions[:, 1] += y_noise[:, 0]
         object_orientations = self._init_object_orientations[None, :].repeat(indices.shape[0], 1)
         object_velocities = torch.zeros(indices.shape[0], 6, device=self.device)
 
@@ -759,26 +883,20 @@ class GraspingTask(RLTask):
         return self.states_buf
 
     def calculate_metrics(self):
-        distances = torch.norm(self.compute_palm_positions() - self.compute_object_positions(), dim=1)
-        self.rew_buf[:] = self._palm_object_distances - distances
-        self._palm_object_distances[:] = distances
+        # distances = torch.norm(self.compute_palm_positions() - self.compute_object_positions(), dim=1)
+        # self.rew_buf[:] = self._palm_object_distances - distances
+        # self._palm_object_distances[:] = distances
 
-        # print("wrist:", self.compute_wrist_positions())
-        # print("object:", self.compute_object_positions())
-
-        # print("fingertip:", self.compute_fingertip_positions())
-
-        # print("distance:", distances)
+        action_penalty = self.action_penalty_scale * torch.sum(self._actions**2, dim=1)
+        distances = torch.mean(self.compute_fingertip_object_distances(), dim=1)
+        self.rew_buf[:] = torch.exp(-10.0 * distances) - action_penalty
 
         reset_buf = self.reset_buf.clone()
         progress_buf = self.progress_buf.clone()
         resets = torch.where(distances >= 0.75, 1, reset_buf)
         resets = torch.where(distances < 0.10, 1, resets)
         resets = torch.where(progress_buf >= self.max_episode_length, 1, resets)
-        # print("progress:", progress_buf)
-
         self.reset_buf[:] = resets
-        # print("resets:", resets)
 
     def is_done(self):
         pass
@@ -800,7 +918,7 @@ class GraspingTask(RLTask):
         if len(env_ids) > 0:
             self.reset_envs_by_indices(env_ids)
 
-        actions = actions.clone().detach().to(self.device)
+        self._actions = actions.clone().detach().to(self.device)
 
         targets = self.compute_joint_targets(actions)
         self._robots.set_joint_position_targets(
@@ -830,6 +948,10 @@ def randomize_rotation(rand0, rand1, x_unit_tensor, y_unit_tensor):
     return quat_mul(
         quat_from_angle_axis(rand0 * np.pi, x_unit_tensor), quat_from_angle_axis(rand1 * np.pi, y_unit_tensor)
     )
+
+
+def uniform(size, *, min_val=-1.0, max_val=1.0, dtype=None, device=None):
+    return (max_val - min_val) * torch.rand(size, dtype=dtype, device=device) + min_val
 
 
 @torch.jit.script
