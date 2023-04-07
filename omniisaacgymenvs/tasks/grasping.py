@@ -139,9 +139,9 @@ class ShadowHandView(ArticulationView):
             reset_xform_properties=False,
         )
 
-        self._wrists = RigidPrimView(
-            prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*wrist",
-            name="WristView",
+        self._palms = RigidPrimView(
+            prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*palm",
+            name="PalmView",
             reset_xform_properties=False,
         )
 
@@ -364,7 +364,7 @@ class GraspingTask(RLTask):
     def create_isaac_robot_view(self, scene: Scene):
         robot_view = ShadowHandView(prim_paths_expr="/World/envs/env_.*/robot/robot", name="robot_view")
         scene.add(robot_view._fingertips)
-        scene.add(robot_view._wrists)
+        scene.add(robot_view._palms)
         return robot_view
 
     def create_table(self):
@@ -511,13 +511,13 @@ class GraspingTask(RLTask):
     ###==================== Compute Observations =====================###
     #####################################################################
 
-    def compute_wrist_positions(self):
-        positions = self._robots._wrists.get_world_poses(clone=False)[0]
+    def compute_palm_positions(self):
+        positions = self._robots._palms.get_world_poses(clone=False)[0]
         positions -= self._env_pos
         return positions
 
-    def compute_wrist_rotations(self):
-        return self._robots._wrists.get_world_poses(clone=False)[1]
+    def compute_palm_rotations(self):
+        return self._robots._palms.get_world_poses(clone=False)[1]
 
     def compute_fingertip_positions(self):
         positions = self._robots._fingertips.get_world_poses(clone=False)[0]
@@ -624,7 +624,7 @@ class GraspingTask(RLTask):
         self._prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._current_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
 
-        self._wrist_object_distances = torch.zeros((self.num_envs), dtype=torch.float, device=self.device)
+        self._palm_object_distances = torch.zeros((self.num_envs), dtype=torch.float, device=self.device)
 
         self._init_dof_positions[self._robots.arm_dof_indices] = self.arm_init_joint_positions
 
@@ -713,8 +713,8 @@ class GraspingTask(RLTask):
         self._current_targets[indices] = joint_positions
 
         # Reset other buffers
-        distances = torch.norm(self.compute_wrist_positions() - self.compute_object_positions(), dim=1)
-        self._wrist_object_distances[indices] = distances[indices]
+        distances = torch.norm(self.compute_palm_positions() - self.compute_object_positions(), dim=1)
+        self._palm_object_distances[indices] = distances[indices]
 
         self.progress_buf[indices] = 0
         self.reset_buf[indices] = 0
@@ -759,9 +759,9 @@ class GraspingTask(RLTask):
         return self.states_buf
 
     def calculate_metrics(self):
-        distances = torch.norm(self.compute_wrist_positions() - self.compute_object_positions(), dim=1)
-        self.rew_buf[:] = self._wrist_object_distances - distances
-        self._wrist_object_distances[:] = distances
+        distances = torch.norm(self.compute_palm_positions() - self.compute_object_positions(), dim=1)
+        self.rew_buf[:] = self._palm_object_distances - distances
+        self._palm_object_distances[:] = distances
 
         # print("wrist:", self.compute_wrist_positions())
         # print("object:", self.compute_object_positions())
