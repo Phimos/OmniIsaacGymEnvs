@@ -1,7 +1,6 @@
 import glob
 import math
 import re
-from abc import abstractmethod
 from pdb import set_trace
 from typing import List, Optional, Tuple
 
@@ -14,7 +13,6 @@ from omni.isaac.core.articulations import ArticulationView
 from omni.isaac.core.objects import DynamicCuboid, FixedCuboid
 from omni.isaac.core.prims import RigidContactView, RigidPrim, RigidPrimView, XFormPrim
 from omni.isaac.core.robots.robot import Robot
-from omni.isaac.core.robots.robot_view import RobotView
 from omni.isaac.core.scenes.scene import Scene
 from omni.isaac.core.utils.nucleus import get_assets_root_path
 from omni.isaac.core.utils.prims import get_prim_at_path
@@ -22,11 +20,8 @@ from omni.isaac.core.utils.stage import add_reference_to_stage, get_current_stag
 from omni.isaac.core.utils.torch import *
 from omni.isaac.gym.vec_env import VecEnvBase
 from omni.isaac.sensor.scripts.camera import Camera
-from omni.isaac.utils.scripts.camera_utils import DynamicCamera
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
-from omniisaacgymenvs.robots.articulations.shadow_hand_ur10e import ShadowHandUR10e
-from omniisaacgymenvs.robots.articulations.views.shadow_hand_ur10e_view import ShadowHandUR10eView
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
 from omniisaacgymenvs.tasks.utils.usd_utils import set_drive
 from omniisaacgymenvs.utils.config_utils.sim_config import SimConfig
@@ -139,6 +134,7 @@ class ShadowHandView(ArticulationView):
             prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*distal",
             name="FingertipView",
             reset_xform_properties=False,
+            track_contact_forces=True,
         )
 
         self._palms = RigidPrimView(
@@ -151,6 +147,7 @@ class ShadowHandView(ArticulationView):
             prim_paths_expr="/World/envs/.*/robot/robot/shadow_hand/robot0.*thdistal",
             name="ThumbView",
             reset_xform_properties=False,
+            track_contact_forces=True,
         )
 
         self._meshes = RigidPrimView(
@@ -237,19 +234,6 @@ class GraspingTask(RLTask):
         self.object_type = self._task_cfg["env"]["objectType"]
         assert self.object_type in YCB_DATASET_OBJECTS
 
-        self.obs_type = self._task_cfg["env"]["observationType"]
-        if not (self.obs_type in ["openai", "full_no_vel", "full", "full_state"]):
-            raise Exception(
-                "Unknown type of observations!\nobservationType should be one of: [openai, full_no_vel, full, full_state]"
-            )
-        print("Obs type:", self.obs_type)
-        self.num_obs_dict = {
-            "openai": 42,
-            "full_no_vel": 77,
-            "full": 157,
-            "full_state": 187,
-        }
-
         self.asymmetric_obs = self._task_cfg["env"]["asymmetric_observations"]
         self.use_vel_obs = False
 
@@ -270,8 +254,27 @@ class GraspingTask(RLTask):
         if self.asymmetric_obs:
             num_states = 187
 
-        # self._num_observations = self.num_obs_dict[self.obs_type]
-        self._num_observations = 100
+        # Define observation space
+        print("Observation type:", self._task_cfg["env"]["observationType"])
+        self.num_points = 1024
+        self.num_joints = 30
+        self.observation_types = self._task_cfg["env"]["observationType"]
+        self.num_observation_per_type = {
+            "imagined_pointcloud": self.num_points * 3,
+            "imagined_hand_pointcloud": self.num_points * 3,
+            "palm_position": 3,
+            "palm_rotation": 4,
+            "fingertip_position": 3 * self.num_fingertips,
+            "fingertip_object_minimum_distance": self.num_fingertips,
+            "object_position": 3,
+            "object_rotation": 4,
+            "goal_position": 3,
+            "goal_rotation": 4,
+            "joint_position": self.num_joints,
+            "joint_velocity": self.num_joints,
+        }
+
+        self._num_observations = sum([self.num_observation_per_type[obs_type] for obs_type in self.observation_types])
         self._num_actions = 26
         self._num_states = num_states
 
@@ -333,14 +336,14 @@ class GraspingTask(RLTask):
             [0, -1.25, 2.00, -np.pi / 4, np.pi / 2, -np.pi], device=self.device
         )
 
-        object_ply_path = "/home/user/Downloads/011_banana.ply"
-        num_points = 1024
-        pointcloud = o3d.io.read_point_cloud(object_ply_path)
-        pointcloud = torch.from_numpy(np.asarray(pointcloud.points)).float()
-        pointcloud = pointcloud[torch.randperm(pointcloud.shape[0])[:num_points]]
-        self.object_pointcloud = pointcloud.to(self.device)
-        self.num_points = num_points
+        # object_ply_path = "/home/user/Downloads/011_banana.ply"
 
+        # pointcloud = o3d.io.read_point_cloud(object_ply_path)
+        # pointcloud = torch.from_numpy(np.asarray(pointcloud.points)).float()
+        # pointcloud = pointcloud[torch.randperm(pointcloud.shape[0])[: self.num_points]]
+        # self.object_pointcloud = pointcloud.to(self.device)
+
+        self.load_object_pointclouds("/home/user/Downloads/banana.ply")
         self.load_pointclouds()
 
     #####################################################################
@@ -357,29 +360,15 @@ class GraspingTask(RLTask):
             name = os.path.splitext(os.path.basename(filepath))[0]
             pointclouds[name] = pointcloud.to(self.device)
 
+        # remove forearm pointcloud and focus on palm & fingers
         pointclouds.pop("forearm")
         self._cached_pointclouds = pointclouds
 
-    def create_robot(self, translation: Optional[torch.Tensor] = None, orientation: Optional[torch.Tensor] = None):
-        translation = torch.tensor([0.0, 0.0, 0.0], device=self.device) if translation is None else translation
-        orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device) if orientation is None else orientation
-
-        usd_path = "/home/user/Downloads/assets/robot/urdf/srhand_ur10e/srhand_ur10e.usd"
-        robot = ShadowHandUR10e(
-            prim_path=self.default_zero_env_path + "/shadow_hand_ur10e",
-            name="shadow_hand_ur10e",
-            translation=translation,
-            orientation=orientation,
-            usd_path=usd_path,
-        )
-
-        self._sim_config.apply_articulation_settings(
-            "shadow_hand_ur10e",
-            get_prim_at_path(robot.prim_path),
-            self._sim_config.parse_actor_config("shadow_hand"),
-        )
-        robot.set_shadow_hand_properties(stage=self._stage, shadow_hand_prim=robot.prim)
-        robot.set_motor_control_mode(stage=self._stage, shadow_hand_path=robot.prim_path)
+    def load_object_pointclouds(self, pointcloud_path: os.PathLike):
+        pointcloud = o3d.io.read_point_cloud(pointcloud_path)
+        pointcloud = torch.from_numpy(np.asarray(pointcloud.points)).float()
+        pointcloud = torch.stack([-pointcloud[:, 0], pointcloud[:, 2], pointcloud[:, 1]], dim=1)
+        self._object_pointcloud = pointcloud.to(self.device)
 
     def create_isaac_robot(self):
         robot_usd_path = "/home/user/Downloads/assets/robot/urdf/robot.usd"
@@ -556,13 +545,51 @@ class GraspingTask(RLTask):
     ###==================== Compute Observations =====================###
     #####################################################################
 
-    def compute_imagined_hand_pointclouds(self) -> torch.Tensor:
+    def normalize_joint_positions(self, joint_positions: torch.Tensor) -> torch.Tensor:
+        """Normalize joint positions to the range -1 to 1."""
+        return (joint_positions - self._dof_lower_limits[self.actuated_dof_indices]) / (
+            self._dof_upper_limits[self.actuated_dof_indices] - self._dof_lower_limits[self.actuated_dof_indices]
+        ) * 2.0 - 1.0
+
+    def denormalize_joint_positions(self, normalized_joint_positions: torch.Tensor) -> torch.Tensor:
+        """Denormalize joint positions from the range -1 to 1."""
+        return (normalized_joint_positions + 1.0) / 2.0 * (
+            self._dof_upper_limits[self.actuated_dof_indices] - self._dof_lower_limits[self.actuated_dof_indices]
+        ) + self._dof_lower_limits[self.actuated_dof_indices]
+
+    def transform_to_palm_coordinates(self, points: torch.Tensor) -> torch.Tensor:
+        """Transform points from world coordinates to palm coordinates.
+
+        Args:
+            points (torch.Tensor): [num_envs, num_points, 3] or [num_envs, 3]
+
+        Returns:
+            torch.Tensor: [num_envs, num_points, 3] or [num_envs, 3] (same shape as input)
+        """
+        positions = self.compute_palm_positions()
+        rotations = self.compute_palm_rotations()
+        return transform_points(points, positions, rotations)
+
+    def transform_to_object_coordinates(self, points: torch.Tensor) -> torch.Tensor:
+        """Transform points from world coordinates to object coordinates.
+
+        Args:
+            points (torch.Tensor): [num_envs, num_points, 3] or [num_envs, 3]
+
+        Returns:
+            torch.Tensor: [num_envs, num_points, 3] or [num_envs, 3] (same shape as input)
+        """
+        positions = self.compute_object_positions()
+        rotations = self.compute_object_rotations()
+        return transform_points(points, positions, rotations)
+
+    def compute_imagined_hand_pointclouds(self, num_points: Optional[int] = None) -> torch.Tensor:
         """Compute the imagined hand pointclouds.
 
         Returns:
             torch.Tensor: [num_envs, num_points, 3]
         """
-        num_points = 4096
+        num_points = num_points or self.num_points
         total_points = sum([pcd.shape[0] for pcd in self._cached_pointclouds.values()])
         num_samples_per_mesh = {
             name: round(num_points * pcd.shape[0] / total_points) for name, pcd in self._cached_pointclouds.items()
@@ -594,10 +621,26 @@ class GraspingTask(RLTask):
             imagined_pointclouds.append(sampled_points)
 
         imagined_pointclouds = torch.cat(imagined_pointclouds, dim=1)
-        # print(imagined_pointclouds.shape)
-        # if not os.path.exists("../imagined_pointcloud.pt"):
-        #     torch.save(imagined_pointclouds, "../imagined_pointcloud.pt")
         return imagined_pointclouds
+
+    def compute_imagined_pointclouds(
+        self, num_points: Optional[int] = None, coordinate_system: str = "world"
+    ) -> torch.Tensor:
+        """Compute the imagined pointclouds (hand + object).
+
+        Returns:
+            torch.Tensor: [num_envs, num_points, 3]
+        """
+        assert coordinate_system in ["world", "palm"], "Invalid coordinate system"
+        num_points = num_points or self.num_points
+        hand_pointclouds = self.compute_imagined_hand_pointclouds(num_points // 2)
+        object_pointclouds = self.compute_object_pointclouds(num_points // 2)
+        pointclouds = torch.cat([hand_pointclouds, object_pointclouds], dim=1)
+
+        if coordinate_system == "palm":
+            pointclouds = self.transform_to_palm_coordinates(pointclouds)
+
+        return pointclouds
 
     def compute_palm_positions(self) -> torch.Tensor:
         """Compute the positions of the palms.
@@ -628,13 +671,21 @@ class GraspingTask(RLTask):
         positions -= self._env_pos
         return positions
 
+    def compute_thumbtip_contact_forces(self) -> torch.Tensor:
+        """Compute the contact forces of the thumb tips.
+
+        Returns:
+            torch.Tensor: [num_envs, 3]
+        """
+        return self._robots._thumbs.get_net_contact_forces(clone=False)
+
     def compute_thumbtip_object_minimum_distances(self) -> torch.Tensor:
         """Compute the minimum distance between thumb tip and the object pointcloud.
 
         Returns:
             torch.Tensor: [num_envs]
         """
-        object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
+        object_pointcloud = self.compute_object_pointclouds()  # [num_envs, num_points, 3]
         fingertip_positions = self.compute_thumbtip_positions()  # [num_envs, 3]
 
         # Compute distances between fingertip positions and object pointcloud
@@ -663,7 +714,8 @@ class GraspingTask(RLTask):
             torch.Tensor: [num_envs, num_fingertips, 4]
         """
         rotations = self._robots._fingertips.get_world_poses(clone=False)[1]
-        return rotations.reshape(self.num_envs, self.num_fingertips, 4)
+        rotations = rotations.reshape(self.num_envs, self.num_fingertips, 4)
+        return rotations
 
     def compute_fingertip_velocities(self) -> torch.Tensor:
         """Compute the velocities of the fingertips. (linear and angular)
@@ -707,7 +759,7 @@ class GraspingTask(RLTask):
         Returns:
             torch.Tensor: [num_envs, num_fingertips]
         """
-        object_pointcloud = self.compute_object_pointcloud()  # [num_envs, num_points, 3]
+        object_pointcloud = self.compute_object_pointclouds()  # [num_envs, num_points, 3]
         fingertip_positions = self.compute_fingertip_positions()  # [num_envs, num_fingertips, 3]
 
         # Compute distances between fingertip positions and object pointcloud
@@ -758,6 +810,13 @@ class GraspingTask(RLTask):
         positions -= self._env_pos
         return positions
 
+    def compute_object_positions_wrt_palm(self) -> torch.Tensor:
+        # TODO: check the correctness of this function
+        palm_rotation = self.compute_palm_rotations()
+        positions = self.compute_object_positions()
+        positions = quat_apply(quat_conjugate(palm_rotation), positions)
+        return positions
+
     def compute_object_rotations(self) -> torch.Tensor:
         """Compute the rotations of the object. (quaternions - wxyz)
 
@@ -790,7 +849,7 @@ class GraspingTask(RLTask):
         """
         return self._objects.get_angular_velocities(clone=False)
 
-    def compute_object_pointcloud(self) -> torch.Tensor:
+    def compute_object_pointclouds(self, num_points: Optional[int] = None) -> torch.Tensor:
         """Compute the pointcloud of the object.
 
         The object pointcloud should be loaded from the object's mesh file.
@@ -798,47 +857,105 @@ class GraspingTask(RLTask):
         Returns:
             torch.Tensor: [num_envs, num_points, 3]
         """
+        num_points = num_points or self.num_points
         positions, rotations = self._objects.get_world_poses(clone=False)
-        pointcloud = self.object_pointcloud.clone()
+        pointcloud = self._object_pointcloud.clone()
+        pointcloud = pointcloud[torch.randperm(pointcloud.shape[0])[:num_points]]
 
         pointcloud = pointcloud.reshape(1, -1, 3).repeat(self.num_envs, 1, 1).reshape(-1, 3)
-        rotations = rotations.reshape(-1, 1, 4).repeat(1, self.num_points, 1).reshape(-1, 4)
+        rotations = rotations.reshape(-1, 1, 4).repeat(1, num_points, 1).reshape(-1, 4)
 
         pointcloud = quat_rotate(rotations, pointcloud).reshape(self.num_envs, -1, 3)
         pointcloud += positions.reshape(self.num_envs, 1, 3)
         pointcloud -= self._env_pos.reshape(self.num_envs, 1, 3)
+
         return pointcloud
+
+    def compute_camera_pointclouds(self, num_points: Optional[int] = None) -> torch.Tensor:
+        """Compute the pointcloud from multiple RGB-D cameras.
+
+        Args:
+            num_points (Optional[int], optional): Number of points to sample from the object pointcloud. Defaults to None.
+
+        Returns:
+            torch.Tensor: [num_envs, num_points, 3]
+        """
+        raise NotImplementedError
 
     def compute_goal_positions(self) -> torch.Tensor:
         positions = self._goals.get_world_poses(clone=False)[0]
         positions -= self._env_pos
         return positions
 
+    def compute_goal_rotations(self) -> torch.Tensor:
+        """Compute the rotations of the goal. (quaternions - wxyz)
+
+        Returns:
+            torch.Tensor: [num_envs, 4]
+        """
+        return self._goals.get_world_poses(clone=False)[1]
+
     #####################################################################
     ###==================== RL Pipeline Functions ====================###
     #####################################################################
 
-    def compute_reach_reward(self, epsilon: float = 0.05) -> torch.Tensor:
+    def compute_reach_reward(
+        self, epsilon: float = 0.06, clip_min: float = 0.03, clip_max: float = 0.8
+    ) -> torch.Tensor:
         distance = self.compute_fingertip_object_distances()
-        reward = (1 / (epsilon + distance)).mean(dim=1)
+        torch.clamp(distance, clip_min, clip_max, out=distance)
+        reward = (1 / (epsilon + distance)).sum(dim=1)
         return reward
 
-    def compute_contact_reward(self, threshold: float = 0.05) -> torch.Tensor:
-        thumbtip_distance = self.compute_thumbtip_object_minimum_distances()
-        fingertip_distance = self.compute_fingertip_object_minimum_distances()
+    def compute_contact_reward(self, threshold: float = 0.03) -> torch.Tensor:
+        # thumbtip_distance = self.compute_thumbtip_object_minimum_distances()
+        # fingertip_distance = self.compute_fingertip_object_minimum_distances()
 
-        thumb_contact = (thumbtip_distance < threshold).to(torch.float32)
-        finger_contact = ((fingertip_distance < threshold).sum(dim=1) >= 2).to(torch.float32)
+        # thumb_contact = (thumbtip_distance < threshold).to(torch.float32)
+        # finger_contact = ((fingertip_distance < threshold).sum(dim=1) >= 2).to(torch.float32)
+        # return thumb_contact * finger_contact
 
-        return thumb_contact * finger_contact
+        distance = self.compute_fingertip_object_distances()
+        thumbtip_contact_force = self.compute_thumbtip_contact_forces()
+        fingertip_contact_force = self.compute_fingertip_contact_forces()
 
-    def compute_lift_reward(self, epsilon: float = 0.05, contact_reward: Optional[torch.Tensor] = None) -> torch.Tensor:
+        distance = torch.mean(distance, dim=1) < threshold
+        thumbtip_contact = torch.norm(thumbtip_contact_force, dim=1) > 0.01
+        fingertip_contact = (torch.norm(fingertip_contact_force, dim=2) > 0.01).sum(dim=1) >= 2
+
+        return (distance * thumbtip_contact * fingertip_contact).to(torch.float32)
+
+    def compute_lift_reward(
+        self, epsilon: float = 0.04, rotation_weight: float = 0.0, contact_reward: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        object_init_position = self._init_object_positions
         object_position = self.compute_object_positions()
         goal_position = self.compute_goal_positions()
+        contact_reward = contact_reward if contact_reward is not None else self.compute_contact_reward()
+        reward = 0.0
+
+        lift = torch.clamp(object_position[:, 2] - self.table_height, 0.0, 0.2)
+        reward += 10.0 * lift
+
+        mask = lift > 0.02
+        if mask.sum() == 0:
+            return contact_reward * reward
+
+        reward[mask] += 1.0
+
         distance = torch.norm(object_position - goal_position, dim=1)
-        reward = 1 / (epsilon + distance)
-        if contact_reward is None:
-            contact_reward = self.compute_contact_reward()
+        reward[mask] += 1.0 / (epsilon + distance[mask])
+
+        mask = mask & (distance < 0.1)
+        if mask.sum() == 0:
+            return contact_reward * reward
+
+        object_quat = self.compute_object_rotations()
+        goal_quat = self.compute_goal_rotations()
+        theta = torch.arccos(
+            torch.clamp(torch.pow(torch.sum(object_quat * goal_quat, dim=1), 2) * 2 - 1, -1 + 1e-8, 1 - 1e-8)
+        )
+        reward[mask] += 4.0 / (0.4 + theta[mask]) * rotation_weight
         return contact_reward * reward
 
     def compute_completion_criteria(self, threshold: float = 0.05) -> torch.Tensor:
@@ -851,30 +968,32 @@ class GraspingTask(RLTask):
         self,
         epsilon: float = 0.05,
         threshold: float = 0.05,
-        weight_reach: float = 1.0,
-        weight_contact: float = 20.0,
+        weight_reach: float = 0.02,
+        weight_contact: float = 1.0,
         weight_lift: float = 1.0,
-        weight_penalty: float = 0.1,
+        weight_penalty: float = 0.01,
         contact_threshold: float = 0.05,
         complete_bonus: float = 250.0,
     ) -> torch.Tensor:
-        reach_reward = self.compute_reach_reward(epsilon)
-        contact_reward = self.compute_contact_reward(contact_threshold)
-        lift_reward = self.compute_lift_reward(epsilon, contact_reward)
+        reach_reward = self.compute_reach_reward()
+        contact_reward = self.compute_contact_reward()
+        lift_reward = self.compute_lift_reward(contact_reward=contact_reward)
         completion_reward = self.compute_completion_criteria(threshold) * complete_bonus
-        action_penalty = torch.sum(self._actions**2, dim=1)
+        joint_velocities = self.compute_joint_velocities()
+        action_penalty = torch.sum(torch.pow(torch.clamp(joint_velocities, -1.0, 1.0), 2), dim=1)
 
-        reward = (
+        return (
             weight_reach * reach_reward
             + weight_contact * contact_reward
             + weight_lift * lift_reward
             + completion_reward
             - weight_penalty * action_penalty
         )
-        return reward
 
     def compute_joint_targets(self, actions: torch.Tensor) -> torch.Tensor:
         actions = actions.clone().to(self.device)
+        actions = torch.clamp(actions, -1.0, 1.0)
+        actions = self.denormalize_joint_positions(actions)
 
         if self.use_relative_control:
             self._current_targets[:, self.actuated_dof_indices] = (
@@ -925,6 +1044,9 @@ class GraspingTask(RLTask):
         # Get joint limits
         dof_limits = self._robots.get_dof_limits()
         self._dof_lower_limits, self._dof_upper_limits = torch.t(dof_limits[0].to(self.device))
+
+        print(self._dof_lower_limits, self._dof_upper_limits)
+        print(self._dof_lower_limits.shape, self._dof_upper_limits.shape)
 
         # TODO: reset goal object
         pass
@@ -1029,45 +1151,39 @@ class GraspingTask(RLTask):
         self.successes[indices] = 0
 
     def get_observations(self):
-        fingertip_positions = self.compute_fingertip_positions()
-        fingertip_positions = fingertip_positions.reshape(self.num_envs, -1)
+        observations = []
 
-        object_positions = self.compute_object_positions()
-        object_positions = object_positions.reshape(self.num_envs, -1)
+        if "imagined_hand_pointcloud" in self.observation_types:
+            observations.append(self.compute_imagined_hand_pointclouds())
+        if "imagined_pointcloud" in self.observation_types:
+            observations.append(self.compute_imagined_pointclouds())
+        if "object_pointcloud" in self.observation_types:
+            observations.append(self.compute_object_pointclouds())
+        if "camera_pointcloud" in self.observation_types:
+            observations.append(self.compute_camera_pointclouds())
 
-        object_rotations = self.compute_object_rotations()
-        object_rotations = object_rotations.reshape(self.num_envs, -1)
+        if "fingertip_position" in self.observation_types:
+            observations.append(self.compute_fingertip_positions())
+        if "palm_position" in self.observation_types:
+            observations.append(self.compute_palm_positions())
+        if "palm_rotation" in self.observation_types:
+            observations.append(self.compute_palm_rotations())
+        if "object_position" in self.observation_types:
+            observations.append(self.compute_object_positions())
+        if "object_rotation" in self.observation_types:
+            observations.append(self.compute_object_rotations())
+        if "goal_position" in self.observation_types:
+            observations.append(self.compute_goal_positions())
+        if "goal_rotation" in self.observation_types:
+            observations.append(self.compute_goal_rotations())
+        if "fingertip_object_minimum_distance" in self.observation_types:
+            observations.append(self.compute_fingertip_object_minimum_distances())
+        if "joint_position" in self.observation_types:
+            observations.append(self.compute_joint_positions())
+        if "joint_velocity" in self.observation_types:
+            observations.append(self.compute_joint_velocities())
 
-        minimum_distances = self.compute_fingertip_object_minimum_distances()
-        minimum_distances = minimum_distances.reshape(self.num_envs, -1)
-
-        joint_positions = self.compute_joint_positions()
-        joint_positions = joint_positions.reshape(self.num_envs, -1)
-
-        joint_velocities = self.compute_joint_velocities()
-        joint_velocities = joint_velocities.reshape(self.num_envs, -1)
-
-        # meshes_positions = self._robots._meshes.get_world_poses()[0]
-        # meshes_positions = meshes_positions.reshape(self.num_envs, -1, 3)
-        # meshes_positions -= self._env_pos[:, None, :]
-        # print(meshes_positions.shape)
-        # print(meshes_positions[0, 0, :])
-
-        self.compute_imagined_hand_pointclouds()
-
-        observations = torch.cat(
-            [
-                fingertip_positions,
-                object_positions,
-                object_rotations,
-                minimum_distances,
-                joint_positions,
-                joint_velocities,
-            ],
-            dim=-1,
-        )
-
-        self.obs_buf[:, : observations.shape[1]] = observations
+        self.obs_buf[:] = torch.cat([observation.reshape(self.num_envs, -1) for observation in observations], dim=-1)
 
         return self.obs_buf
 
@@ -1085,7 +1201,7 @@ class GraspingTask(RLTask):
         self.rew_buf[:] = self.compute_dexpoint_reward()
 
         object_positions = self.compute_object_positions()
-        fails = torch.where(distances >= 0.75, 1, 0)
+        fails = torch.where(distances >= 0.8, 1, 0)
         fails = torch.where(object_positions[:, 2] < self.table_height, 1, fails)
         self.rew_buf -= self.fall_penalty * fails
 
@@ -1228,6 +1344,33 @@ def compute_hand_reward(
     )
 
     return reward, resets, goal_resets, progress_buf, successes, cons_successes
+
+
+def transform_points(points: torch.Tensor, positions: torch.Tensor, rotations: torch.Tensor):
+    """Transform points by positions and rotations.
+
+    transform T = [R, t]
+    apply p' = T^{-1}  p
+
+    Args:
+        points: world points tensor of shape (batch_size, num_points, 3) or (batch_size, 3)
+        positions: world2local translation tensor of shape (batch_size, 3)
+        rotations: world2local rotation tensor of shape (batch_size, 4)
+    """
+    assert points.ndim == 3 or points.ndim == 2
+    assert points.shape[-1] == 3
+
+    ndim = points.ndim
+    points = points.unsqueeze(-2) if ndim == 2 else points
+    points = points - positions.unsqueeze(-2)
+    num_envs, num_points, _ = points.shape
+
+    points = points.reshape(-1, 3)
+    rotations = rotations.reshape(-1, 1, 4).repeat(1, num_points, 1).reshape(-1, 4)
+    points = quat_rotate_inverse(rotations, points)
+    points = points.reshape(num_envs, num_points, 3)
+    print(points[0])
+    return points.squeeze(-2) if ndim == 2 else points
 
 
 def random_points_on_hypersphere(n_points, n_dim, device):
